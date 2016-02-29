@@ -6,6 +6,8 @@
 from multiprocessing import Pool
 from collections import deque
 
+from packet import Raw
+from layers.l2 import Ether
 from utils import *
 from packet_proxy import *
 

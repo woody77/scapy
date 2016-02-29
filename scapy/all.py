@@ -47,3 +47,6 @@ from crypto import *
 
 from pipetool import *
 from scapypipes import *
+
+from packet_proxy import *
+from parallel_pcap_reader import *
