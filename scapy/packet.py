@@ -32,9 +32,26 @@ class RawVal:
         return "<RawVal [%r]>" % self.val
 
 
+def packet__setattr(self, attr, val):
+    if self.write_magic:
+        try:
+            self.setfieldval(attr,val)
+        except AttributeError:
+            pass
+        else:
+            return
+    self.__dict__[attr] = val
+
+
 class Packet(BasePacket):
     __metaclass__ = Packet_metaclass
     name=None
+
+    # class-static caches of parsed subclass data
+    #  each is a per-subclass cache of data
+    cached_default_fields = {}
+    cached_fieldtype = {}
+    cached_packetfields = {}
 
     fields_desc = []
 
@@ -71,13 +88,34 @@ class Packet(BasePacket):
         if self.name is None:
             self.name = self.__class__.__name__
         self.aliastypes = [ self.__class__ ] + self.aliastypes
-        self.default_fields = {}
+        
+        try:
+            # get cached objects
+            self.default_fields = Packet.cached_default_fields[self.name]
+        except KeyError:
+            Packet.cached_default_fields[self.name] = {f.name: f.default for f in self.fields_desc}
+            self.default_fields = Packet.cached_default_fields[self.name]
+                
         self.overloaded_fields = {}
         self.fields={}
-        self.fieldtype={}
-        self.packetfields=[]
+
+        try:
+            # get the cached field types
+            self.fieldtype = Packet.cached_fieldtype[self.name]
+        except KeyError:
+            Packet.cached_fieldtype[self.name] = {f.name: f for f in self.fields_desc}
+            self.fieldtype = Packet.cached_fieldtype[self.name]
+
+        try:
+            # get the cached packet fields
+            self.packetfields = Packet.cached_packetfields[self.name]
+        except KeyError:
+            Packet.cached_packetfields[self.name] = [f for f in self.fields_desc if f.holds_packets]
+            self.packetfields = Packet.cached_packetfields[self.name]
+        
+
         self.__dict__["payload"] = NoPayload()
-        self.init_fields()
+        #self.init_fields()
         self.underlayer = _underlayer
         self.initialized = 1
         self.original = _pkt
@@ -93,16 +131,18 @@ class Packet(BasePacket):
             self.post_transforms = []
         else:
             self.post_transforms = [post_transform]
+        self.__setattr__ = packet__setattr
 
-    def init_fields(self):
-        self.do_init_fields(self.fields_desc)
 
-    def do_init_fields(self, flist):
-        for f in flist:
-            self.default_fields[f.name] = copy.deepcopy(f.default)
-            self.fieldtype[f.name] = f
-            if f.holds_packets:
-                self.packetfields.append(f)
+#    def init_fields(self):
+#        self.do_init_fields(self.fields_desc)
+
+#    def do_init_fields(self, flist):
+#        for f in flist:
+#            self.default_fields[f.name] = copy.deepcopy(f.default)
+#            self.fieldtype[f.name] = f
+#            if f.holds_packets:
+#                self.packetfields.append(f)
             
     def dissection_done(self,pkt):
         """DEV: will be called after a dissection is completed"""
@@ -161,22 +201,29 @@ class Packet(BasePacket):
         return clone
 
     def getfieldval(self, attr):
-        if attr in self.fields:
+        try:
             return self.fields[attr]
-        if attr in self.overloaded_fields:
-            return self.overloaded_fields[attr]
-        if attr in self.default_fields:
-            return self.default_fields[attr]
-        return self.payload.getfieldval(attr)
-    
+        except KeyError:
+            try:
+                return self.overloaded_fields[attr]
+            except KeyError:
+                try:
+                    return self.default_fields[attr]
+                except KeyError:
+                    return self.payload.getfieldval(attr)
+
     def getfield_and_val(self, attr):
-        if attr in self.fields:
-            return self.get_field(attr),self.fields[attr]
-        if attr in self.overloaded_fields:
-            return self.get_field(attr),self.overloaded_fields[attr]
-        if attr in self.default_fields:
-            return self.get_field(attr),self.default_fields[attr]
-        return self.payload.getfield_and_val(attr)
+        try:
+            v = self.fields[attr]
+        except KeyError:
+            try:
+                v = self.overloaded_fields[attr]
+            except KeyError:
+                try:
+                    v = self.default_fields[attr]
+                except KeyError:
+                    return self.payload.getfield_and_val(attr)
+        return self.fieldtype[attr],v
     
     def __getattr__(self, attr):
         if self.initialized:
@@ -203,15 +250,15 @@ class Packet(BasePacket):
         else:
             self.payload.setfieldval(attr,val)
 
-    def __setattr__(self, attr, val):
-        if self.initialized:
-            try:
-                self.setfieldval(attr,val)
-            except AttributeError:
-                pass
-            else:
-                return
-        self.__dict__[attr] = val
+#    def __setattr__(self, attr, val):
+#        if self.initialized:
+#            try:
+#                self.setfieldval(attr,val)
+#            except AttributeError:
+#                pass
+#            else:
+#                return
+#        self.__dict__[attr] = val
 
     def delfieldval(self, attr):
         if self.fields.has_key(attr):
@@ -574,18 +621,19 @@ Creates an EPS file describing a packet. If filename is not provided a temporary
         return s
 
     def do_dissect(self, s):
-        flist = self.fields_desc[:]
-        flist.reverse()
+        flist = self.fields_desc
         raw = s
         self.raw_packet_cache_fields = {}
-        while s and flist:
-            f = flist.pop()
-            s, fval = f.getfield(self, s)
-            # We need to track fields with mutable values to discard
-            # .raw_packet_cache when needed.
-            if f.islist or f.holds_packets:
-                self.raw_packet_cache_fields[f.name] = f.do_copy(fval)
-            self.fields[f.name] = fval
+        for f in flist:
+            if s:
+                s, fval = f.getfield(self, s)
+                # We need to track fields with mutable values to discard
+                # .raw_packet_cache when needed.
+                if f.islist or f.holds_packets:
+                    self.raw_packet_cache_fields[f.name] = f.do_copy(fval)
+                self.fields[f.name] = fval
+            else:
+                break
         assert(raw.endswith(s))
         if s:
             self.raw_packet_cache = raw[:-len(s)]
